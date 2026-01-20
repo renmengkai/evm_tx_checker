@@ -32,16 +32,33 @@ fn load_query_mode() -> String {
 }
 
 #[derive(Serialize)]
-struct RpcRequest<'a> {
+struct RpcRequestSingle<'a> {
     jsonrpc: &'a str,
     method: &'a str,
-    params: RpcParams<'a>,
+    params: RpcParamsSingle<'a>,
+    id: u32,
+}
+
+#[derive(Serialize)]
+struct RpcRequestMulti<'a> {
+    jsonrpc: &'a str,
+    method: &'a str,
+    params: RpcParamsMulti<'a>,
     id: u32,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RpcParams<'a> {
+struct RpcParamsSingle<'a> {
+    blockchain: &'a str,
+    address: &'a str,
+    desc_order: bool,
+    page_size: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcParamsMulti<'a> {
     blockchain: Vec<&'a str>,
     address: &'a str,
     desc_order: bool,
@@ -54,7 +71,9 @@ struct RpcResponse {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct RpcResult {
+    next_page_token: Option<String>,
     transactions: Vec<Transaction>,
 }
 
@@ -222,14 +241,14 @@ async fn get_last_txs_single_chain(client: &Client, address: &str, chain: &str, 
         format!("{}/{}", ANKR_RPC_BASE, api_key)
     };
 
-    let payload = RpcRequest {
+    let payload = RpcRequestSingle {
         jsonrpc: "2.0",
         method: "ankr_getTransactionsByAddress",
-        params: RpcParams {
-            blockchain: vec![chain],
+        params: RpcParamsSingle {
+            blockchain: chain,
             address,
             desc_order: true,
-            page_size: 100,
+            page_size: 1,
         },
         id: 1,
     };
@@ -252,6 +271,11 @@ async fn get_last_txs_single_chain(client: &Client, address: &str, chain: &str, 
                                     tx_chain: chain.to_string(),
                                 });
                             }
+                        }
+                        if attempt == 1 {
+                            println!("⚠ {} on {}: 初次查询无交易，重新确认中...", address, chain);
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue;
                         }
                         println!("○ {} on {}: 无交易", address, chain);
                         return Some(QueryResult {
@@ -310,6 +334,41 @@ async fn get_last_txs_single_chain(client: &Client, address: &str, chain: &str, 
     None
 }
 
+async fn confirm_no_transaction(client: &Client, base_url: &str, address: &str, chain: &str) -> (bool, String, String) {
+    let payload = RpcRequestSingle {
+        jsonrpc: "2.0",
+        method: "ankr_getTransactionsByAddress",
+        params: RpcParamsSingle {
+            blockchain: chain,
+            address,
+            desc_order: true,
+            page_size: 1,
+        },
+        id: 1,
+    };
+
+    match timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), client.post(base_url).json(&payload).send()).await {
+        Ok(Ok(r)) => {
+            let text = r.text().await.unwrap_or_default();
+            match serde_json::from_str::<RpcResponse>(&text) {
+                Ok(json_body) => {
+                    if let Some(res) = json_body.result {
+                        if let Some(tx) = res.transactions.first() {
+                            let tx_hash = tx.hash.clone();
+                            let tx_time = format_timestamp(&tx.timestamp);
+                            return (false, tx_hash, tx_time);
+                        }
+                    }
+                    (true, "无交易".to_string(), "N/A".to_string())
+                }
+                Err(_) => (true, "解析失败".to_string(), "N/A".to_string()),
+            }
+        }
+        Ok(Err(_)) => (true, "网络错误".to_string(), "N/A".to_string()),
+        Err(_) => (true, "超时".to_string(), "N/A".to_string()),
+    }
+}
+
 async fn get_last_txs_batch(client: &Client, addresses: &[String], chains: Vec<String>, api_key: &str, semaphore: Arc<Semaphore>) -> Vec<QueryResult> {
     let base_url = if api_key.is_empty() {
         ANKR_RPC_BASE.to_string()
@@ -333,14 +392,14 @@ async fn get_last_txs_batch(client: &Client, addresses: &[String], chains: Vec<S
             let _permit = semaphore.acquire().await.unwrap();
             let blockchain_vec: Vec<&str> = blockchain_vec_arc.iter().map(|s| s.as_str()).collect();
 
-            let payload = RpcRequest {
+            let payload = RpcRequestMulti {
                 jsonrpc: "2.0",
                 method: "ankr_getTransactionsByAddress",
-                params: RpcParams {
+                params: RpcParamsMulti {
                     blockchain: blockchain_vec,
                     address: &addr,
                     desc_order: true,
-                    page_size: 100,
+                    page_size: 30,
                 },
                 id: 1,
             };
@@ -376,24 +435,46 @@ async fn get_last_txs_batch(client: &Client, addresses: &[String], chains: Vec<S
                                                     tx_chain: chain.to_string(),
                                                 });
                                             } else {
-                                                println!("○ {} on {}: 无交易", addr, chain);
-                                                results.push(QueryResult {
-                                                    address: addr.clone(),
-                                                    tx_hash: "无交易".to_string(),
-                                                    tx_time: "N/A".to_string(),
-                                                    tx_chain: chain.to_string(),
-                                                });
+                                                let (is_empty, tx_hash, tx_time) = confirm_no_transaction(&client_clone, &url, &addr, chain).await;
+                                                if is_empty {
+                                                    println!("○ {} on {}: 无交易 (已确认)", addr, chain);
+                                                    results.push(QueryResult {
+                                                        address: addr.clone(),
+                                                        tx_hash,
+                                                        tx_time,
+                                                        tx_chain: chain.to_string(),
+                                                    });
+                                                } else {
+                                                    println!("✓ {} on {}: {} @ {}", addr, chain, &tx_hash[..12], tx_time);
+                                                    results.push(QueryResult {
+                                                        address: addr.clone(),
+                                                        tx_hash,
+                                                        tx_time,
+                                                        tx_chain: chain.to_string(),
+                                                    });
+                                                }
                                             }
                                         }
                                     } else {
                                         for chain in &chains_clone {
-                                            println!("○ {} on {}: 无交易记录", addr, chain);
-                                            results.push(QueryResult {
-                                                address: addr.clone(),
-                                                tx_hash: "无交易".to_string(),
-                                                tx_time: "N/A".to_string(),
-                                                tx_chain: chain.to_string(),
-                                            });
+                                            let (is_empty, tx_hash, tx_time) = confirm_no_transaction(&client_clone, &url, &addr, chain).await;
+                                            if is_empty {
+                                                println!("○ {} on {}: 无交易记录 (已确认)", addr, chain);
+                                                results.push(QueryResult {
+                                                    address: addr.clone(),
+                                                    tx_hash,
+                                                    tx_time,
+                                                    tx_chain: chain.to_string(),
+                                                });
+                                            } else {
+                                                println!("✓ {} on {}: {} @ {}", addr, chain, &tx_hash[..12], tx_time);
+                                                results.push(QueryResult {
+                                                    address: addr.clone(),
+                                                    tx_hash,
+                                                    tx_time,
+                                                    tx_chain: chain.to_string(),
+                                                });
+                                            }
                                         }
                                     }
                                 } else {
