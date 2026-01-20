@@ -18,11 +18,17 @@ const ANKR_RPC_BASE: &str = "https://rpc.ankr.com/multichain";
 const WALLET_FILE: &str = "data/wallets.csv";
 const DEFAULT_CONCURRENCY: usize = 10;
 const DEFAULT_CHAINS: &str = "eth,bsc,polygon,arbitrum,optimism,avalanche";
-const REQUEST_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_QUERY_MODE: &str = "multi";
+const REQUEST_TIMEOUT_SECS: u64 = 60;
+const MAX_RETRIES: u32 = 5;
 
 fn load_target_chains() -> Vec<String> {
     let chains_str = std::env::var("TARGET_CHAINS").unwrap_or_else(|_| DEFAULT_CHAINS.to_string());
     chains_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+}
+
+fn load_query_mode() -> String {
+    std::env::var("QUERY_MODE").unwrap_or_else(|_| DEFAULT_QUERY_MODE.to_string()).to_lowercase()
 }
 
 #[derive(Serialize)]
@@ -209,6 +215,101 @@ struct QueryResult {
     tx_chain: String,
 }
 
+async fn get_last_txs_single_chain(client: &Client, address: &str, chain: &str, api_key: &str) -> Option<QueryResult> {
+    let base_url = if api_key.is_empty() {
+        ANKR_RPC_BASE.to_string()
+    } else {
+        format!("{}/{}", ANKR_RPC_BASE, api_key)
+    };
+
+    let payload = RpcRequest {
+        jsonrpc: "2.0",
+        method: "ankr_getTransactionsByAddress",
+        params: RpcParams {
+            blockchain: vec![chain],
+            address,
+            desc_order: true,
+            page_size: 100,
+        },
+        id: 1,
+    };
+
+    for attempt in 1..=MAX_RETRIES {
+        match timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), client.post(&base_url).json(&payload).send()).await {
+            Ok(Ok(r)) => {
+                let text = r.text().await.unwrap_or_default();
+                match serde_json::from_str::<RpcResponse>(&text) {
+                    Ok(json_body) => {
+                        if let Some(res) = json_body.result {
+                            if let Some(tx) = res.transactions.first() {
+                                let tx_hash = tx.hash.clone();
+                                let tx_time = format_timestamp(&tx.timestamp);
+                                println!("✓ {} on {}: {} @ {}", address, chain, &tx_hash[..12], tx_time);
+                                return Some(QueryResult {
+                                    address: address.to_string(),
+                                    tx_hash,
+                                    tx_time,
+                                    tx_chain: chain.to_string(),
+                                });
+                            }
+                        }
+                        println!("○ {} on {}: 无交易", address, chain);
+                        return Some(QueryResult {
+                            address: address.to_string(),
+                            tx_hash: "无交易".to_string(),
+                            tx_time: "N/A".to_string(),
+                            tx_chain: chain.to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        if attempt < MAX_RETRIES {
+                            println!("⚠ JSON 解析失败 ({} on {}, 第 {} 次重试): {}", address, chain, attempt, e);
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                        println!("✗ JSON 解析失败 (地址: {}): {}", address, e);
+                        return Some(QueryResult {
+                            address: address.to_string(),
+                            tx_hash: "解析失败".to_string(),
+                            tx_time: "N/A".to_string(),
+                            tx_chain: chain.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                if attempt < MAX_RETRIES {
+                    println!("⚠ 网络错误 ({} on {}, 第 {} 次重试): {}", address, chain, attempt, e);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+                println!("✗ 网络错误 (地址: {}): {}", address, e);
+                return Some(QueryResult {
+                    address: address.to_string(),
+                    tx_hash: "网络错误".to_string(),
+                    tx_time: "N/A".to_string(),
+                    tx_chain: chain.to_string(),
+                });
+            }
+            Err(_) => {
+                if attempt < MAX_RETRIES {
+                    println!("⚠ 请求超时 ({} on {}, 第 {} 次重试): 超过 {} 秒", address, chain, attempt, REQUEST_TIMEOUT_SECS);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+                println!("✗ 请求超时 (地址: {}): 超过 {} 秒", address, REQUEST_TIMEOUT_SECS);
+                return Some(QueryResult {
+                    address: address.to_string(),
+                    tx_hash: "超时".to_string(),
+                    tx_time: "N/A".to_string(),
+                    tx_chain: chain.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
 async fn get_last_txs_batch(client: &Client, addresses: &[String], chains: Vec<String>, api_key: &str, semaphore: Arc<Semaphore>) -> Vec<QueryResult> {
     let base_url = if api_key.is_empty() {
         ANKR_RPC_BASE.to_string()
@@ -247,34 +348,46 @@ async fn get_last_txs_batch(client: &Client, addresses: &[String], chains: Vec<S
             let mut results = Vec::new();
             let chains_clone = (*chains_arc).clone();
 
-            match timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), client_clone.post(&url).json(&payload).send()).await {
-                Ok(Ok(r)) => {
-                    let text = r.text().await.unwrap_or_default();
+            for attempt in 1..=MAX_RETRIES {
+                match timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), client_clone.post(&url).json(&payload).send()).await {
+                    Ok(Ok(r)) => {
+                        let text = r.text().await.unwrap_or_default();
 
-                    match serde_json::from_str::<RpcResponse>(&text) {
-                        Ok(json_body) => {
-                            if let Some(res) = json_body.result {
-                                let txs = res.transactions;
-                                if !txs.is_empty() {
-                                    let mut by_chain: std::collections::HashMap<String, &Transaction> = std::collections::HashMap::new();
-                                    for tx in &txs {
-                                        if !tx.hash.is_empty() && !by_chain.contains_key(&tx.blockchain) {
-                                            by_chain.insert(tx.blockchain.clone(), tx);
+                        match serde_json::from_str::<RpcResponse>(&text) {
+                            Ok(json_body) => {
+                                if let Some(res) = json_body.result {
+                                    let txs = res.transactions;
+                                    if !txs.is_empty() {
+                                        let mut by_chain: std::collections::HashMap<String, &Transaction> = std::collections::HashMap::new();
+                                        for tx in &txs {
+                                            if !tx.hash.is_empty() && !by_chain.contains_key(&tx.blockchain) {
+                                                by_chain.insert(tx.blockchain.clone(), tx);
+                                            }
                                         }
-                                    }
-                                    for chain in &chains_clone {
-                                        if let Some(tx) = by_chain.get(chain) {
-                                            let tx_hash = tx.hash.clone();
-                                            let tx_time = format_timestamp(&tx.timestamp);
-                                            println!("✓ {} on {}: {} @ {}", addr, chain, &tx_hash[..12], tx_time);
-                                            results.push(QueryResult {
-                                                address: addr.clone(),
-                                                tx_hash,
-                                                tx_time,
-                                                tx_chain: chain.to_string(),
-                                            });
-                                        } else {
-                                            println!("○ {} on {}: 无交易", addr, chain);
+                                        for chain in &chains_clone {
+                                            if let Some(tx) = by_chain.get(chain) {
+                                                let tx_hash = tx.hash.clone();
+                                                let tx_time = format_timestamp(&tx.timestamp);
+                                                println!("✓ {} on {}: {} @ {}", addr, chain, &tx_hash[..12], tx_time);
+                                                results.push(QueryResult {
+                                                    address: addr.clone(),
+                                                    tx_hash,
+                                                    tx_time,
+                                                    tx_chain: chain.to_string(),
+                                                });
+                                            } else {
+                                                println!("○ {} on {}: 无交易", addr, chain);
+                                                results.push(QueryResult {
+                                                    address: addr.clone(),
+                                                    tx_hash: "无交易".to_string(),
+                                                    tx_time: "N/A".to_string(),
+                                                    tx_chain: chain.to_string(),
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        for chain in &chains_clone {
+                                            println!("○ {} on {}: 无交易记录", addr, chain);
                                             results.push(QueryResult {
                                                 address: addr.clone(),
                                                 tx_hash: "无交易".to_string(),
@@ -285,60 +398,69 @@ async fn get_last_txs_batch(client: &Client, addresses: &[String], chains: Vec<S
                                     }
                                 } else {
                                     for chain in &chains_clone {
-                                        println!("○ {} on {}: 无交易记录", addr, chain);
+                                        println!("○ {} on {}: result 为空", addr, chain);
                                         results.push(QueryResult {
                                             address: addr.clone(),
-                                            tx_hash: "无交易".to_string(),
+                                            tx_hash: "无数据".to_string(),
                                             tx_time: "N/A".to_string(),
                                             tx_chain: chain.to_string(),
                                         });
                                     }
                                 }
-                            } else {
+                                break;
+                            }
+                            Err(e) => {
+                                if attempt < MAX_RETRIES {
+                                    println!("⚠ JSON 解析失败 ({} on 多链, 第 {} 次重试): {}", addr, attempt, e);
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                    continue;
+                                }
+                                println!("✗ JSON 解析失败 (地址: {}): {}", addr, e);
                                 for chain in &chains_clone {
-                                    println!("○ {} on {}: result 为空", addr, chain);
                                     results.push(QueryResult {
                                         address: addr.clone(),
-                                        tx_hash: "无数据".to_string(),
+                                        tx_hash: "解析失败".to_string(),
                                         tx_time: "N/A".to_string(),
                                         tx_chain: chain.to_string(),
                                     });
                                 }
-                            }
-                        }
-                        Err(e) => {
-                            println!("✗ JSON 解析失败 (地址: {}): {}", addr, e);
-                            for chain in &chains_clone {
-                                results.push(QueryResult {
-                                    address: addr.clone(),
-                                    tx_hash: "解析失败".to_string(),
-                                    tx_time: "N/A".to_string(),
-                                    tx_chain: chain.to_string(),
-                                });
+                                break;
                             }
                         }
                     }
-                }
-                Ok(Err(e)) => {
-                    println!("✗ 网络错误 (地址: {}): {}", addr, e);
-                    for chain in &chains_clone {
-                        results.push(QueryResult {
-                            address: addr.clone(),
-                            tx_hash: "网络错误".to_string(),
-                            tx_time: "N/A".to_string(),
-                            tx_chain: chain.to_string(),
-                        });
+                    Ok(Err(e)) => {
+                        if attempt < MAX_RETRIES {
+                            println!("⚠ 网络错误 ({} on 多链, 第 {} 次重试): {}", addr, attempt, e);
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                        println!("✗ 网络错误 (地址: {}): {}", addr, e);
+                        for chain in &chains_clone {
+                            results.push(QueryResult {
+                                address: addr.clone(),
+                                tx_hash: "网络错误".to_string(),
+                                tx_time: "N/A".to_string(),
+                                tx_chain: chain.to_string(),
+                            });
+                        }
+                        break;
                     }
-                }
-                Err(_) => {
-                    println!("✗ 请求超时 (地址: {}): 超过 {} 秒", addr, REQUEST_TIMEOUT_SECS);
-                    for chain in &chains_clone {
-                        results.push(QueryResult {
-                            address: addr.clone(),
-                            tx_hash: "超时".to_string(),
-                            tx_time: "N/A".to_string(),
-                            tx_chain: chain.to_string(),
-                        });
+                    Err(_) => {
+                        if attempt < MAX_RETRIES {
+                            println!("⚠ 请求超时 ({} on 多链, 第 {} 次重试): 超过 {} 秒", addr, attempt, REQUEST_TIMEOUT_SECS);
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                        println!("✗ 请求超时 (地址: {}): 超过 {} 秒", addr, REQUEST_TIMEOUT_SECS);
+                        for chain in &chains_clone {
+                            results.push(QueryResult {
+                                address: addr.clone(),
+                                tx_hash: "超时".to_string(),
+                                tx_time: "N/A".to_string(),
+                                tx_chain: chain.to_string(),
+                            });
+                        }
+                        break;
                     }
                 }
             }
@@ -368,6 +490,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_CONCURRENCY.to_string())
         .parse()
         .unwrap_or(DEFAULT_CONCURRENCY);
+    let query_mode = load_query_mode();
 
     if api_key.is_empty() {
         println!("⚠️  警告: 未设置 ANKR_API_KEY");
@@ -378,7 +501,8 @@ async fn main() -> Result<()> {
         println!("✓ 已加载 ANKR_API_KEY（{}...）\n", &api_key[..api_key.len().min(8)]);
     }
 
-    println!("✓ 并发数: {}\n", concurrency);
+    println!("✓ 并发数: {}", concurrency);
+    println!("✓ 查询模式: {}\n", query_mode);
 
     let target_chains = load_target_chains();
     println!("✓ 目标链: {}\n", target_chains.join(", "));
@@ -387,9 +511,40 @@ async fn main() -> Result<()> {
     let addresses_str: Vec<String> = wallet_addresses;
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
-    println!("开始批量查询... (链数量: {}, 地址数量: {})\n", target_chains.len(), addresses_str.len());
+    let results = match query_mode.as_str() {
+        "single" => {
+            println!("使用单链查询模式...\n");
+            let mut all_results = Vec::new();
+            for chain in &target_chains {
+                println!("=== 查询链: {} ===", chain);
+                let mut tasks = Vec::new();
+                for address in &addresses_str {
+                    let client_clone = client.clone();
+                    let addr = address.clone();
+                    let semaphore = semaphore.clone();
+                    let chain_name = chain.clone();
+                    let api_key = api_key.clone();
 
-    let results = get_last_txs_batch(&client, &addresses_str, target_chains.clone(), &api_key, semaphore).await;
+                    tasks.push(tokio::spawn(async move {
+                        let _permit = semaphore.acquire().await.unwrap();
+                        get_last_txs_single_chain(&client_clone, &addr, &chain_name, &api_key).await
+                    }));
+                }
+                let chain_results = join_all(tasks).await;
+                for res in chain_results {
+                    if let Ok(Some(result)) = res {
+                        all_results.push(result);
+                    }
+                }
+                println!();
+            }
+            all_results
+        }
+        _ => {
+            println!("使用多链同时查询模式... (链数量: {}, 地址数量: {})\n", target_chains.len(), addresses_str.len());
+            get_last_txs_batch(&client, &addresses_str, target_chains.clone(), &api_key, semaphore).await
+        }
+    };
 
     println!();
 
