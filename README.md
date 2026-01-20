@@ -5,15 +5,17 @@
 ## 功能
 
 - 批量查询多个钱包地址的交易记录
-- 支持多条区块链（Arbitrum、Optimism）
+- 支持多条区块链（ETH、BSC、Polygon、Arbitrum、Optimism、Avalanche、zkSync）
+- 支持从私钥自动导出钱包地址
 - 输出到 Excel 文件格式
-- 采用批量查询优化（每条链只需2次API调用）
+- 支持两种配置文件格式（CSV 和 TXT）
+- 时间戳自动转换为本地时间
 
 ## 使用方法
 
-### 设置环境变量
+### 1. 设置 Ankr API 密钥
 
-首先设置 Ankr API 密钥：
+首先获取 Ankr API 密钥并设置环境变量：
 
 ```bash
 # Windows PowerShell
@@ -26,13 +28,40 @@ set ANKR_API_KEY=your_api_key_here
 export ANKR_API_KEY=your_api_key_here
 ```
 
-### 编译
+或者在项目根目录创建 `.env` 文件：
+
+```
+ANKR_API_KEY=your_api_key_here
+```
+
+### 2. 准备钱包地址列表
+
+创建配置文件，支持以下两种格式：
+
+**方式一：CSV 格式** (`config/wallets.csv`)
+```csv
+0x742d35Cc6634C0532925a3b844Bc9e7595f8fEb5
+0x1234567890abcdef1234567890abcdef12345678
+```
+
+**方式二：TXT 格式** (`config/wallets.txt`)
+```
+0x742d35Cc6634C0532925a3b844Bc9e7595f8fEb5
+0x1234567890abcdef1234567890abcdef12345678
+```
+
+**方式三：直接使用私钥**（程序会自动转换为地址）
+```txt
+0xabcd1234...
+```
+
+### 3. 编译
 
 ```bash
 cargo build --release
 ```
 
-### 运行
+### 4. 运行
 
 ```bash
 # Windows
@@ -42,13 +71,6 @@ cargo build --release
 ./target/release/evm_tx_checker
 ```
 
-### 配置查询参数
-
-编辑 `src/main.rs` 中的常量来修改：
-
-- `TARGET_CHAINS` - 要查询的区块链列表
-- `WALLET_ADDRESSES` - 要查询的钱包地址列表
-
 ## 输出
 
 程序会生成 `wallet_last_tx.xlsx` Excel 文件，包含以下列：
@@ -56,10 +78,10 @@ cargo build --release
 | 列名 | 说明 |
 |------|------|
 | 钱包地址 | 查询的钱包地址 |
-| 最后交易时间 | 最新交易的时间戳 |
+| 最后交易时间 (Local) | 最新交易的本地时间戳 |
 | 交易 Hash | 最新交易的哈希值 |
 
-每条链对应一个工作表（Sheet）。
+每条链对应一个工作表（Sheet），支持 7 条链：eth、bsc、polygon、arbitrum、optimism、avalanche、zksync。
 
 ## 技术栈
 
@@ -69,19 +91,26 @@ cargo build --release
 - **JSON 处理**：serde + serde_json
 - **Excel 输出**：rust_xlsxwriter v0.60
 - **DateTime**：chrono v0.4
+- **密码学**：k256（ECDSA 签名）、sha3（Keccak256 哈希）
+- **配置处理**：dotenv、csv
 
 ## API 信息
 
 - **RPC 基础 URL**：`https://rpc.ankr.com/multichain/{api_key}`
 - **主要方法**：`ankr_getTransactionsByAddress` - 批量查询交易
 - **支持的链标识符**：
+  - `eth` - Ethereum
+  - `bsc` - Binance Smart Chain
+  - `polygon` - Polygon
   - `arbitrum` - Arbitrum One
   - `optimism` - Optimism
+  - `avalanche` - Avalanche C-Chain
+  - `zksync` - zkSync Era
 
 ## 已知限制
 
-- 交易时间戳字段当前显示为 "N/A"（Ankr RPC 不支持 `eth_getBlockByNumber`）
-- 每条链最多返回前 100 条交易（由 `page_size` 参数限制）
+- 每条链最多返回前 100 条交易（由 API 限制）
+- 需要有效的 Ankr API 密钥才能正常查询
 
 ## 构建详情
 
