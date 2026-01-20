@@ -11,10 +11,13 @@ use sha3::Digest;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 const ANKR_RPC_BASE: &str = "https://rpc.ankr.com/multichain";
 const TARGET_CHAINS: &[&str; 7] = &["eth", "bsc", "polygon", "arbitrum", "optimism", "avalanche", "zksync"];
-const WALLET_FILE: &str = "config/wallets.csv";
+const WALLET_FILE: &str = "data/wallets.csv";
+const DEFAULT_CONCURRENCY: usize = 10;
 
 #[derive(Serialize)]
 struct RpcRequest<'a> {
@@ -134,7 +137,7 @@ fn load_wallet_addresses() -> Result<Vec<String>> {
         return Ok(addresses);
     }
     
-    if let Ok(file) = File::open("config/wallets.txt") {
+    if let Ok(file) = File::open("data/wallets.txt") {
         for line in io::BufReader::new(file).lines() {
             if let Ok(line) = line {
                 let (normalized, is_private_key) = identify_input(&line);
@@ -156,11 +159,11 @@ fn load_wallet_addresses() -> Result<Vec<String>> {
                 }
             }
         }
-        println!("✓ 从 config/wallets.txt 读取到 {} 个地址\n", addresses.len());
+        println!("✓ 从 data/wallets.txt 读取到 {} 个地址\n", addresses.len());
         return Ok(addresses);
     }
     
-    Err(anyhow::anyhow!("未找到钱包文件 (config/wallets.csv 或 config/wallets.txt)"))
+    Err(anyhow::anyhow!("未找到钱包文件 (data/wallets.csv 或 data/wallets.txt)"))
 }
 
 fn format_timestamp(hex_timestamp: &str) -> String {
@@ -191,7 +194,7 @@ struct QueryResult {
     tx_time: String,
 }
 
-async fn get_last_txs(client: &Client, chain: &str, addresses: &[String], api_key: &str) -> Vec<QueryResult> {
+async fn get_last_txs(client: &Client, chain: &str, addresses: &[String], api_key: &str, semaphore: Arc<Semaphore>) -> Vec<QueryResult> {
     let base_url = if api_key.is_empty() {
         ANKR_RPC_BASE.to_string()
     } else {
@@ -205,8 +208,11 @@ async fn get_last_txs(client: &Client, chain: &str, addresses: &[String], api_ke
         let url = base_url.clone();
         let chain_name = chain.to_string();
         let addr = address.clone();
+        let semaphore = semaphore.clone();
         
         tasks.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            
             let payload = RpcRequest {
                 jsonrpc: "2.0",
                 method: "ankr_getTransactionsByAddress",
@@ -273,6 +279,10 @@ async fn main() -> Result<()> {
 
     dotenv().ok();
     let api_key = std::env::var("ANKR_API_KEY").unwrap_or_else(|_| String::new());
+    let concurrency: usize = std::env::var("CONCURRENCY")
+        .unwrap_or_else(|_| DEFAULT_CONCURRENCY.to_string())
+        .parse()
+        .unwrap_or(DEFAULT_CONCURRENCY);
     
     if api_key.is_empty() {
         println!("⚠️  警告: 未设置 ANKR_API_KEY");
@@ -283,8 +293,11 @@ async fn main() -> Result<()> {
         println!("✓ 已加载 ANKR_API_KEY（{}...）\n", &api_key[..api_key.len().min(8)]);
     }
 
+    println!("✓ 并发数: {}\n", concurrency);
+
     let wallet_addresses = load_wallet_addresses()?;
     let addresses_str: Vec<String> = wallet_addresses;
+    let semaphore = Arc::new(Semaphore::new(concurrency));
 
     println!("开始批量查询... (链数量: {}, 地址数量: {})\n", TARGET_CHAINS.len(), addresses_str.len());
 
@@ -292,9 +305,10 @@ async fn main() -> Result<()> {
         let client_ref = client.clone();
         let api_key_ref = api_key.clone();
         let addresses_clone = addresses_str.clone();
+        let semaphore = semaphore.clone();
         
         tasks.push(tokio::spawn(async move {
-            get_last_txs(&client_ref, chain, &addresses_clone, &api_key_ref).await
+            get_last_txs(&client_ref, chain, &addresses_clone, &api_key_ref, semaphore).await
         }));
     }
 

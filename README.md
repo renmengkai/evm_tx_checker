@@ -32,7 +32,15 @@ export ANKR_API_KEY=your_api_key_here
 
 ```
 ANKR_API_KEY=your_api_key_here
+CONCURRENCY=10
 ```
+
+### 可选配置
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `ANKR_API_KEY` | Ankr 多链 RPC API 密钥 | 无（必需） |
+| `CONCURRENCY` | 并发请求数量 | 10 |
 
 ### 2. 准备钱包地址列表
 
